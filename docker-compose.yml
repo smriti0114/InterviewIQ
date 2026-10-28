@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./interviewiq.db
+      - JWT_SECRET_KEY=interviewiq_super_secret_jwt_key_change_in_production_92837482
+      - LLM_PROVIDER=gemini
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_MODEL=gemini-2.5-flash
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+    volumes:
+      - backend-data:/app/data
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api
+
+volumes:
+  backend-data:
