@@ -1,8 +1,15 @@
 import logging
+import sys
+from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, status
+
+# Ensure backend directory is in sys.path regardless of current working directory
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.db.init_db import init_db
@@ -66,8 +73,11 @@ def health_check():
         "service": settings.PROJECT_NAME,
         "version": settings.VERSION,
         "database": "connected",
-        "llm_provider": api_status.llm_provider,
-        "llm_configured": api_status.is_configured
+        "llm_provider": api_status.provider,
+        "llm_model": api_status.model,
+        "llm_configured": api_status.api_key_configured,
+        "connection_status": api_status.connection_status,
+        "mode": api_status.mode,
     }
 
 

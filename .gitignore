@@ -13,6 +13,8 @@ env/
 .coverage
 htmlcov/
 test_*.db
+.env.*
+!.env.example
 
 # Node & Frontend
 frontend/node_modules/
@@ -36,3 +38,9 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3

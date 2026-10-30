@@ -13,11 +13,13 @@ import {
   X,
   User,
   ShieldCheck,
-  AlertCircle
+  AlertCircle,
+  XCircle
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { api } from '../services/api';
+import { getStatusDisplay } from '../utils/statusHelpers';
 
 export default function Navbar() {
   const { user, isAuthenticated, logout } = useAuth();
@@ -39,6 +41,16 @@ export default function Navbar() {
       }
     }
     fetchStatus();
+
+    const handleStatusUpdate = (e) => {
+      if (e.detail) {
+        setApiStatus(e.detail);
+      }
+    };
+    window.addEventListener('interviewiq:llm_status_updated', handleStatusUpdate);
+    return () => {
+      window.removeEventListener('interviewiq:llm_status_updated', handleStatusUpdate);
+    };
   }, []);
 
   const handleLogout = () => {
@@ -104,24 +116,27 @@ export default function Navbar() {
           {/* Right Header Utilities */}
           <div className="hidden md:flex items-center gap-3">
             {/* LLM Status Badge */}
-            {apiStatus && (
-              <Link
-                to="/settings"
-                title={apiStatus.message}
-                className={`hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border transition-colors ${
-                  apiStatus.is_configured
-                    ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800'
-                    : 'bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800'
-                }`}
-              >
-                {apiStatus.is_configured ? (
-                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
-                ) : (
-                  <AlertCircle className="w-3.5 h-3.5 text-amber-500" />
-                )}
-                <span>{apiStatus.is_configured ? apiStatus.llm_provider : 'API Key Unset'}</span>
-              </Link>
-            )}
+            {apiStatus && (() => {
+              const statusInfo = getStatusDisplay(apiStatus);
+              return (
+                <Link
+                  to="/settings"
+                  title={apiStatus.message || statusInfo.label}
+                  className={`hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border transition-colors ${statusInfo.color}`}
+                >
+                  {statusInfo.icon === 'check' ? (
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
+                  ) : statusInfo.icon === 'error' ? (
+                    <XCircle className="w-3.5 h-3.5 text-rose-500" />
+                  ) : statusInfo.icon === 'info' ? (
+                    <ShieldCheck className="w-3.5 h-3.5 text-blue-500" />
+                  ) : (
+                    <AlertCircle className="w-3.5 h-3.5 text-amber-500" />
+                  )}
+                  <span>{statusInfo.label}</span>
+                </Link>
+              );
+            })()}
 
             {/* Dark / Light Mode Toggle */}
             <button
@@ -224,6 +239,31 @@ export default function Navbar() {
               {link.label}
             </Link>
           ))}
+
+          {apiStatus && (() => {
+            const statusInfo = getStatusDisplay(apiStatus);
+            return (
+              <Link
+                to="/settings"
+                onClick={() => setMobileMenuOpen(false)}
+                className={`flex items-center justify-between px-3 py-2 rounded-xl text-xs font-semibold border my-2 ${statusInfo.color}`}
+              >
+                <div className="flex items-center gap-2">
+                  {statusInfo.icon === 'check' ? (
+                    <ShieldCheck className="w-4 h-4 text-emerald-500" />
+                  ) : statusInfo.icon === 'error' ? (
+                    <XCircle className="w-4 h-4 text-rose-500" />
+                  ) : statusInfo.icon === 'info' ? (
+                    <ShieldCheck className="w-4 h-4 text-blue-500" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-amber-500" />
+                  )}
+                  <span>LLM: {statusInfo.label}</span>
+                </div>
+                <span className="text-[10px] underline">Manage</span>
+              </Link>
+            );
+          })()}
           {isAuthenticated ? (
             <button
               onClick={() => {

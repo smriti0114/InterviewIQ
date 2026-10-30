@@ -131,3 +131,10 @@ def change_password(
 def check_api_status():
     """Returns safe LLM provider status without exposing credentials."""
     return llm_service.get_api_status()
+
+
+@router.post("/test-llm-connection", response_model=ApiConfigStatus)
+async def test_api_connection():
+    """Verifies live LLM provider connectivity."""
+    return await llm_service.test_connection()
+

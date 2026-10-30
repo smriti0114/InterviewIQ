@@ -13,7 +13,8 @@ import {
   Clock,
   ShieldCheck,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Zap
 } from 'lucide-react';
 import { api } from '../services/api';
 import { useToast } from '../context/ToastContext';
@@ -59,9 +60,10 @@ export default function GeneratorPage() {
       try {
         const status = await api.getConfigStatus();
         setApiStatus(status);
-        if (!status.is_configured) {
-          // If no API key configured, default demoMode to true so local test works effortlessly
+        if (!status.is_configured || status.connection_status === 'missing_key') {
           setDemoMode(true);
+        } else {
+          setDemoMode(false);
         }
       } catch (err) {
         console.error('Failed to get API status:', err);
@@ -152,30 +154,74 @@ export default function GeneratorPage() {
       </div>
 
       {/* API Key Status Notice */}
-      {apiStatus && !apiStatus.is_configured && (
-        <div className="p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 text-xs">
-          <div className="flex items-start gap-3">
-            <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-            <div className="space-y-0.5">
-              <p className="font-bold text-amber-900 dark:text-amber-200">
-                LLM API Key Not Detected in backend .env
-              </p>
-              <p className="text-amber-700 dark:text-amber-300">
-                Demo Mode is automatically enabled to generate instant, realistic mock questions. To connect live Gemini/OpenAI models, configure your key in{' '}
-                <a href="/settings" className="underline font-semibold">Settings</a>.
+      {apiStatus && (
+        apiStatus.connection_status === 'connected' ? (
+          <div className="p-3.5 rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-900 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+              <p className="font-bold text-emerald-900 dark:text-emerald-200">
+                Live AI Mode Active: Powered by {apiStatus.provider || apiStatus.llm_provider} ({apiStatus.model || apiStatus.llm_model})
               </p>
             </div>
+            <label className="flex items-center gap-2 font-medium text-emerald-800 dark:text-emerald-300 shrink-0 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={demoMode}
+                onChange={(e) => setDemoMode(e.target.checked)}
+                className="accent-emerald-600 rounded"
+              />
+              <span>Force Mock Simulation</span>
+            </label>
           </div>
-          <label className="flex items-center gap-2 font-semibold text-amber-800 dark:text-amber-200 shrink-0 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={demoMode}
-              onChange={(e) => setDemoMode(e.target.checked)}
-              className="accent-amber-600 rounded"
-            />
-            <span>Demo / Simulation Mode</span>
-          </label>
-        </div>
+        ) : apiStatus.is_configured && apiStatus.connection_status !== 'missing_key' ? (
+          <div className="p-4 rounded-2xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 text-xs">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />
+              <div className="space-y-0.5">
+                <p className="font-bold text-rose-900 dark:text-rose-200">
+                  LLM Connection Alert: {apiStatus.message || 'Error communicating with AI service'}
+                </p>
+                <p className="text-rose-700 dark:text-rose-300">
+                  Requests may fallback to Demo Mode. Check your API key and quota in{' '}
+                  <a href="/settings" className="underline font-semibold">Settings</a>.
+                </p>
+              </div>
+            </div>
+            <label className="flex items-center gap-2 font-semibold text-rose-800 dark:text-rose-200 shrink-0 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={demoMode}
+                onChange={(e) => setDemoMode(e.target.checked)}
+                className="accent-rose-600 rounded"
+              />
+              <span>Demo Mode</span>
+            </label>
+          </div>
+        ) : (
+          <div className="p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 text-xs">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+              <div className="space-y-0.5">
+                <p className="font-bold text-amber-900 dark:text-amber-200">
+                  LLM API Key Not Detected in backend/.env
+                </p>
+                <p className="text-amber-700 dark:text-amber-300">
+                  Demo Mode is automatically enabled to generate instant, realistic mock questions. To connect live Gemini/OpenAI models, configure your key in{' '}
+                  <a href="/settings" className="underline font-semibold">Settings</a>.
+                </p>
+              </div>
+            </div>
+            <label className="flex items-center gap-2 font-semibold text-amber-800 dark:text-amber-200 shrink-0 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={demoMode}
+                onChange={(e) => setDemoMode(e.target.checked)}
+                className="accent-amber-600 rounded"
+              />
+              <span>Demo / Simulation Mode</span>
+            </label>
+          </div>
+        )
       )}
 
       {/* Quick Role Presets Bar */}

@@ -61,7 +61,8 @@ export const api = {
   getMe: () => request('/auth/me'),
   updateProfile: (payload) => request('/auth/me', { method: 'PUT', body: JSON.stringify(payload) }),
   changePassword: (payload) => request('/auth/change-password', { method: 'POST', body: JSON.stringify(payload) }),
-  getConfigStatus: () => request('/auth/config-status'),
+  getConfigStatus: () => request('/settings/config-status'),
+  testLlmConnection: () => request('/settings/test-llm-connection', { method: 'POST' }),
 
   // Interviews
   generateInterview: (payload) => request('/interviews/generate', { method: 'POST', body: JSON.stringify(payload) }),

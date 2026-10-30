@@ -1,12 +1,14 @@
+import asyncio
 import json
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
 import httpx
 from fastapi import HTTPException, status
 
-from app.core.config import settings
+from app.core.config import settings, reload_settings
 from app.schemas.interview import (
     InterviewGenerateRequest,
     GeneratedQuestion,
@@ -25,11 +27,15 @@ logger = logging.getLogger("interviewiq.llm")
 def clean_json_text(raw_text: str) -> str:
     """Strip markdown code fence blocks if returned by the LLM."""
     text = raw_text.strip()
-    # Strip ```json ... ```
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
     return text.strip()
+
+
+def sanitize_url_for_logging(url: str) -> str:
+    """Strip API keys from URLs for safe logging."""
+    return re.sub(r"key=[^&\s]+", "key=[REDACTED]", url)
 
 
 class BaseLLMProvider(ABC):
@@ -38,15 +44,86 @@ class BaseLLMProvider(ABC):
         """Call LLM provider and return raw response string."""
         pass
 
+    @abstractmethod
+    async def verify_connection(self) -> Dict[str, Any]:
+        """Perform a lightweight test request to verify API credentials and connectivity."""
+        pass
+
 
 class GeminiProvider(BaseLLMProvider):
     def __init__(self, api_key: str, model: Optional[str] = None):
-        self.api_key = api_key
+        self.api_key = api_key.strip()
         self.model = model or "gemini-2.5-flash"
         self.base_url = "https://generativelanguage.googleapis.com/v1beta"
 
+    async def verify_connection(self) -> Dict[str, Any]:
+        """Verify API key and model validity using Google Gemini models endpoint."""
+        url = f"{self.base_url}/models/{self.model}?key={self.api_key}"
+        safe_url = sanitize_url_for_logging(url)
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                resp = await client.get(url)
+            except httpx.TimeoutException:
+                return {
+                    "status": "connection_error",
+                    "message": "Connection to Google Gemini API timed out after 15s.",
+                }
+            except httpx.RequestError as exc:
+                return {
+                    "status": "connection_error",
+                    "message": f"Network error connecting to Gemini API: {type(exc).__name__}",
+                }
+
+            if resp.status_code == 200:
+                return {
+                    "status": "connected",
+                    "message": f"Gemini API connection successful ({self.model})",
+                }
+
+            # Parse error details from Google response
+            err_msg = ""
+            err_reason = ""
+            try:
+                err_data = resp.json()
+                err_obj = err_data.get("error", {})
+                err_msg = err_obj.get("message", "")
+                details = err_obj.get("details", [])
+                for d in details:
+                    if isinstance(d, dict) and "reason" in d:
+                        err_reason = d["reason"]
+            except Exception:
+                err_msg = resp.text[:200]
+
+            logger.warning(
+                f"Gemini connection verification failed ({resp.status_code}): {err_msg} [{err_reason}] at {safe_url}"
+            )
+
+            if resp.status_code in (400, 403) or "API_KEY_INVALID" in err_reason or "API key not valid" in err_msg:
+                return {
+                    "status": "authentication_error",
+                    "message": f"Invalid Gemini API key: {err_msg or 'Authentication failed.'}",
+                }
+            elif resp.status_code == 404 or "not found" in err_msg.lower():
+                return {
+                    "status": "invalid_model",
+                    "message": f"Configured Gemini model '{self.model}' not found in Gemini API catalog.",
+                }
+            elif resp.status_code == 429 or "RESOURCE_EXHAUSTED" in err_reason:
+                return {
+                    "status": "quota_exceeded",
+                    "message": f"Gemini API quota exhausted or rate limit reached: {err_msg}",
+                }
+            else:
+                return {
+                    "status": "connection_error",
+                    "message": f"Gemini API returned HTTP {resp.status_code}: {err_msg}",
+                }
+
     async def generate_completion(self, prompt: str, system_prompt: str) -> str:
         url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
+        safe_url = sanitize_url_for_logging(url)
+
         payload = {
             "contents": [
                 {
@@ -61,55 +138,159 @@ class GeminiProvider(BaseLLMProvider):
                 "maxOutputTokens": 8192,
             }
         }
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            try:
-                resp = await client.post(url, json=payload)
-            except httpx.RequestError as exc:
-                logger.error(f"Gemini API network error: {exc}")
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Unable to connect to Gemini API: {str(exc)}"
-                )
 
-            if resp.status_code != 200:
-                logger.error(f"Gemini API returned error {resp.status_code}: {resp.text}")
-                detail_msg = "Gemini API error"
+        # Try request with limited retry for transient network hiccups
+        max_attempts = 2
+        last_error = None
+
+        for attempt in range(max_attempts):
+            async with httpx.AsyncClient(timeout=50.0) as client:
                 try:
-                    err_json = resp.json()
-                    detail_msg = err_json.get("error", {}).get("message", resp.text)
-                except Exception:
-                    detail_msg = resp.text
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Gemini API error ({resp.status_code}): {detail_msg}"
-                )
+                    resp = await client.post(url, json=payload)
+                except httpx.TimeoutException as exc:
+                    logger.warning(f"Gemini request timeout on attempt {attempt + 1}")
+                    last_error = exc
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise HTTPException(
+                        status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                        detail="Gemini API request timed out after 50s. Please try again."
+                    )
+                except httpx.RequestError as exc:
+                    logger.warning(f"Gemini network error on attempt {attempt + 1}: {type(exc).__name__}")
+                    last_error = exc
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail=f"Unable to connect to Gemini API: {type(exc).__name__}"
+                    )
 
-            data = resp.json()
-            try:
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    raise ValueError("No candidates returned by Gemini")
-                text = candidates[0]["content"]["parts"][0]["text"]
-                return text
-            except (KeyError, IndexError, ValueError) as e:
-                logger.error(f"Failed to extract candidate text from Gemini: {e}")
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="Malformed response received from Gemini API"
-                )
+                if resp.status_code != 200:
+                    err_msg = ""
+                    err_reason = ""
+                    try:
+                        err_json = resp.json()
+                        err_obj = err_json.get("error", {})
+                        err_msg = err_obj.get("message", "")
+                        for d in err_obj.get("details", []):
+                            if isinstance(d, dict) and "reason" in d:
+                                err_reason = d["reason"]
+                    except Exception:
+                        err_msg = resp.text[:200]
+
+                    logger.error(f"Gemini API returned error {resp.status_code}: {err_msg} [{err_reason}] at {safe_url}")
+
+                    # Distinguish authentication errors
+                    if resp.status_code in (400, 403) and ("API_KEY_INVALID" in err_reason or "API key not valid" in err_msg):
+                        raise HTTPException(
+                            status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail=f"Gemini API authentication failed: {err_msg}. Please check your LLM_API_KEY in backend/.env."
+                        )
+
+                    # Distinguish model not found
+                    if resp.status_code == 404 or "not found" in err_msg.lower():
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Gemini model '{self.model}' is not found or unsupported for generateContent: {err_msg}"
+                        )
+
+                    # Distinguish rate limit / quota
+                    if resp.status_code == 429 or "RESOURCE_EXHAUSTED" in err_reason:
+                        raise HTTPException(
+                            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail=f"Gemini API quota exceeded or rate limit reached: {err_msg}"
+                        )
+
+                    # For 5xx, retry once
+                    if resp.status_code >= 500 and attempt < max_attempts - 1:
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail=f"Gemini API error ({resp.status_code}): {err_msg}"
+                    )
+
+                data = resp.json()
+                try:
+                    candidates = data.get("candidates", [])
+                    if not candidates:
+                        raise ValueError("No candidates returned by Gemini")
+                    text = candidates[0]["content"]["parts"][0]["text"]
+                    return text
+                except (KeyError, IndexError, ValueError) as e:
+                    logger.error(f"Failed to extract candidate text from Gemini response: {e}")
+                    raise HTTPException(
+                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        detail="Malformed response received from Gemini API"
+                    )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gemini generation failed: {str(last_error)}"
+        )
 
 
 class OpenAIProvider(BaseLLMProvider):
     def __init__(self, api_key: str, model: Optional[str] = None, base_url: Optional[str] = None):
-        self.api_key = api_key
+        self.api_key = api_key.strip()
         self.model = model or "gpt-4o-mini"
         self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+
+    async def verify_connection(self) -> Dict[str, Any]:
+        url = f"{self.base_url}/models"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                resp = await client.get(url, headers=headers)
+            except httpx.TimeoutException:
+                return {
+                    "status": "connection_error",
+                    "message": "Connection to LLM API timed out after 15s.",
+                }
+            except httpx.RequestError as exc:
+                return {
+                    "status": "connection_error",
+                    "message": f"Network error connecting to LLM API: {type(exc).__name__}",
+                }
+
+            if resp.status_code == 200:
+                return {
+                    "status": "connected",
+                    "message": f"OpenAI-compatible API connection successful ({self.model})",
+                }
+            elif resp.status_code == 401:
+                return {
+                    "status": "authentication_error",
+                    "message": "Invalid API key or unauthorized access.",
+                }
+            elif resp.status_code == 404:
+                return {
+                    "status": "invalid_model",
+                    "message": f"Endpoint or model not found on {self.base_url}.",
+                }
+            elif resp.status_code == 429:
+                return {
+                    "status": "quota_exceeded",
+                    "message": "API quota exceeded or rate limit reached.",
+                }
+            else:
+                return {
+                    "status": "connection_error",
+                    "message": f"LLM API returned HTTP {resp.status_code}",
+                }
 
     async def generate_completion(self, prompt: str, system_prompt: str) -> str:
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
         payload = {
             "model": self.model,
@@ -124,20 +305,31 @@ class OpenAIProvider(BaseLLMProvider):
             try:
                 resp = await client.post(url, headers=headers, json=payload)
             except httpx.RequestError as exc:
-                logger.error(f"OpenAI-compatible API network error: {exc}")
+                logger.error(f"OpenAI-compatible API network error: {type(exc).__name__}")
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Unable to connect to LLM API: {str(exc)}"
+                    detail=f"Unable to connect to LLM API: {type(exc).__name__}"
                 )
 
             if resp.status_code != 200:
-                logger.error(f"LLM API returned {resp.status_code}: {resp.text}")
                 detail_msg = "LLM API error"
                 try:
                     err_json = resp.json()
-                    detail_msg = err_json.get("error", {}).get("message", resp.text)
+                    detail_msg = err_json.get("error", {}).get("message", resp.text[:200])
                 except Exception:
-                    detail_msg = resp.text
+                    detail_msg = resp.text[:200]
+
+                if resp.status_code == 401:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail=f"LLM API authentication error: {detail_msg}"
+                    )
+                if resp.status_code == 429:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail=f"LLM API quota exceeded: {detail_msg}"
+                    )
+
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail=f"LLM API error ({resp.status_code}): {detail_msg}"
@@ -155,9 +347,14 @@ class OpenAIProvider(BaseLLMProvider):
 
 class MockProvider(BaseLLMProvider):
     """Generates dynamic role-specific questions for testing and demo evaluation."""
+    async def verify_connection(self) -> Dict[str, Any]:
+        return {
+            "status": "configured",
+            "message": "Simulated Mock Provider Active",
+        }
+
     async def generate_completion(self, prompt: str, system_prompt: str) -> str:
-        # Extract role and skills hints if present in prompt
-        return "{}"  # Handled directly by LLMService mock generator for high-fidelity responses
+        return "{}"
 
 
 class LLMService:
@@ -167,6 +364,20 @@ class LLMService:
         self.model = settings.LLM_MODEL
         self.base_url = settings.LLM_BASE_URL
         self._provider: Optional[BaseLLMProvider] = None
+        self._connection_cache: Dict[str, Any] = {
+            "status": None,
+            "timestamp": 0.0,
+            "message": "",
+        }
+        self._init_provider()
+
+    def reload_config(self):
+        """Reload configuration from centralized settings to reflect any .env edits."""
+        fresh = reload_settings()
+        self.provider_name = fresh.LLM_PROVIDER.lower()
+        self.api_key = fresh.LLM_API_KEY
+        self.model = fresh.LLM_MODEL
+        self.base_url = fresh.LLM_BASE_URL
         self._init_provider()
 
     def _init_provider(self):
@@ -184,28 +395,94 @@ class LLMService:
             self._provider = GeminiProvider(api_key=self.api_key, model=self.model)
 
     def get_api_status(self) -> ApiConfigStatus:
+        self.reload_config()
         has_key = bool(self.api_key and len(self.api_key.strip()) > 5)
         provider_display = self.provider_name.capitalize()
         model_display = self.model or ("gemini-2.5-flash" if self.provider_name in ("gemini", "google") else "gpt-4o-mini")
 
-        if has_key:
+        if not has_key:
             return ApiConfigStatus(
-                llm_provider=provider_display,
-                llm_model=model_display,
-                is_configured=True,
-                has_api_key=True,
-                message=f"Connected to {provider_display} API ({model_display})"
-            )
-        else:
-            return ApiConfigStatus(
-                llm_provider=provider_display,
-                llm_model=model_display,
-                is_configured=False,
-                has_api_key=False,
-                message=f"API key missing. Set LLM_API_KEY (or GEMINI_API_KEY) in backend/.env to enable live generation."
+                provider=provider_display,
+                model=model_display,
+                api_key_configured=False,
+                connection_status="missing_key",
+                mode="simulated",
+                message="API key missing. Set LLM_API_KEY (or GEMINI_API_KEY) in backend/.env to enable live generation.",
             )
 
+        # Check cached verification if valid (within 120 seconds)
+        now = time.time()
+        cached_status = self._connection_cache.get("status")
+        cached_time = self._connection_cache.get("timestamp", 0)
+        cached_msg = self._connection_cache.get("message", "")
+
+        if cached_status and (now - cached_time < 120.0):
+            mode = "live" if cached_status in ("connected", "configured") else "simulated"
+            return ApiConfigStatus(
+                provider=provider_display,
+                model=model_display,
+                api_key_configured=True,
+                connection_status=cached_status,
+                mode=mode,
+                message=cached_msg or f"{provider_display} API status: {cached_status}",
+            )
+
+        return ApiConfigStatus(
+            provider=provider_display,
+            model=model_display,
+            api_key_configured=True,
+            connection_status="configured",
+            mode="live",
+            message=f"{provider_display} API key is configured. Click 'Test Connection' to verify live connectivity.",
+        )
+
+    async def test_connection(self) -> ApiConfigStatus:
+        """Perform actual provider test and update cache."""
+        self.reload_config()
+        has_key = bool(self.api_key and len(self.api_key.strip()) > 5)
+        provider_display = self.provider_name.capitalize()
+        model_display = self.model or ("gemini-2.5-flash" if self.provider_name in ("gemini", "google") else "gpt-4o-mini")
+
+        if not has_key or not self._provider:
+            status_obj = ApiConfigStatus(
+                provider=provider_display,
+                model=model_display,
+                api_key_configured=False,
+                connection_status="missing_key",
+                mode="simulated",
+                message="Cannot test connection: No API key configured in backend/.env",
+            )
+            self._connection_cache = {
+                "status": "missing_key",
+                "timestamp": time.time(),
+                "message": status_obj.message,
+            }
+            return status_obj
+
+        result = await self._provider.verify_connection()
+        conn_status = result.get("status", "connection_error")
+        msg = result.get("message", "")
+        mode = "live" if conn_status == "connected" else "simulated"
+
+        self._connection_cache = {
+            "status": conn_status,
+            "timestamp": time.time(),
+            "message": msg,
+        }
+
+        return ApiConfigStatus(
+            provider=provider_display,
+            model=model_display,
+            api_key_configured=True,
+            connection_status=conn_status,
+            mode=mode,
+            message=msg,
+        )
+
     async def generate_interview_questions(self, req: InterviewGenerateRequest) -> List[GeneratedQuestion]:
+        # Always check latest config
+        self.reload_config()
+
         # Check if demo mode was requested or mock provider is active
         if req.demo_mode or self.provider_name == "mock":
             return self._generate_dynamic_mock_questions(req)
@@ -214,11 +491,11 @@ class LLMService:
         if not self._provider or not self.api_key:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="LLM API key is not configured. Please add your GEMINI_API_KEY or OPENAI_API_KEY to the backend .env file, or check Settings. You can also test with 'Demo Mode' enabled in the generator."
+                detail="LLM API key is not configured. Please add your GEMINI_API_KEY or LLM_API_KEY to the backend .env file, or check Settings. You can also test with 'Demo Mode' enabled in the generator."
             )
 
         prompt = build_generation_prompt(req)
-        
+
         # Retry loop for malformed JSON outputs
         last_error = None
         for attempt in range(2):
@@ -233,11 +510,9 @@ class LLMService:
 
                 questions: List[GeneratedQuestion] = []
                 for idx, q_dict in enumerate(questions_data):
-                    # Guarantee id and number sequence
                     q_dict["id"] = q_dict.get("id") or f"q-{idx + 1}"
                     q_dict["number"] = idx + 1
-                    
-                    # Ensure rubric exists
+
                     if "evaluation_rubric" not in q_dict or not q_dict["evaluation_rubric"]:
                         q_dict["evaluation_rubric"] = [
                             {
@@ -262,6 +537,8 @@ class LLMService:
 
                 if questions:
                     return questions
+            except HTTPException:
+                raise
             except (json.JSONDecodeError, ValueError, Exception) as exc:
                 logger.warning(f"Generation attempt {attempt + 1} failed: {exc}")
                 last_error = exc
@@ -278,6 +555,7 @@ class LLMService:
         current_question: dict,
         feedback: Optional[str] = None
     ) -> GeneratedQuestion:
+        self.reload_config()
         if parent_req.demo_mode or self.provider_name == "mock" or not self._provider:
             return self._generate_single_mock_question(parent_req, current_question, feedback)
 
@@ -293,11 +571,12 @@ class LLMService:
                 q_dict["number"] = current_question.get("number", 1)
 
                 return GeneratedQuestion.model_validate(q_dict)
+            except HTTPException:
+                raise
             except Exception as exc:
                 logger.warning(f"Regeneration attempt {attempt + 1} failed: {exc}")
                 continue
 
-        # Fallback to single dynamic question generator if provider fails
         return self._generate_single_mock_question(parent_req, current_question, feedback)
 
     def _generate_dynamic_mock_questions(self, req: InterviewGenerateRequest) -> List[GeneratedQuestion]:
@@ -311,8 +590,7 @@ class LLMService:
 
         for i in range(1, count + 1):
             skill = skills[(i - 1) % len(skills)]
-            
-            # Select question type and difficulty
+
             q_type = req.interview_type
             if q_type == "Mixed":
                 types_cycle = ["Technical", "Coding", "Behavioral", "System Design", "HR"]
@@ -323,7 +601,6 @@ class LLMService:
                 diffs_cycle = ["Easy", "Medium", "Hard"]
                 diff = diffs_cycle[(i - 1) % len(diffs_cycle)]
 
-            # Construct question based on role & skill
             if q_type == "Technical":
                 q_text = f"In {req.role_title} workflows using {skill}, how do you diagnose and resolve performance degradation or bottlenecks under high load? Describe your step-by-step investigation methodology."
                 topic = f"{skill} Performance & Debugging"
@@ -374,7 +651,6 @@ class LLMService:
                 concepts = ["Time Management", "Transparent Communication", "Continuous Learning", "Team Accountability"]
                 red_flags = ["Overpromising and silently missing deadlines", "Blaming others for lack of clarity"]
 
-            # Rubric criteria with sum equal to 10
             rubric = [
                 RubricCriterion(
                     criterion_name="Technical Precision & Depth",
@@ -418,8 +694,8 @@ class LLMService:
             ]
 
             follow_ups = [
-                f"How would your approach change if the scale increased by 100x?",
-                f"What monitoring metrics or telemetry would you alert on in production for this scenario?"
+                "How would your approach change if the scale increased by 100x?",
+                "What monitoring metrics or telemetry would you alert on in production for this scenario?"
             ]
 
             question = GeneratedQuestion(
@@ -457,7 +733,7 @@ class LLMService:
         fb_note = f" (Focus: {feedback})" if feedback else ""
 
         q_text = f"Refined Assessment for {parent_req.role_title}: How would you architect and test a production-grade component in {skill} with high resilience?{fb_note}"
-        
+
         return GeneratedQuestion(
             id=qid,
             number=num,

@@ -11,12 +11,19 @@ import {
   Check,
   Sliders,
   Terminal,
-  ExternalLink
+  ExternalLink,
+  RefreshCw,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
+  Zap
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { useToast } from '../context/ToastContext';
 import { api } from '../services/api';
+import { getStatusDisplay } from '../utils/statusHelpers';
 
 export default function SettingsPage() {
   const { user, updateUser } = useAuth();
@@ -52,12 +59,14 @@ export default function SettingsPage() {
   // API Config Status
   const [apiStatus, setApiStatus] = useState(null);
   const [statusLoading, setStatusLoading] = useState(true);
+  const [testingConnection, setTestingConnection] = useState(false);
 
   useEffect(() => {
     async function loadStatus() {
       try {
         const status = await api.getConfigStatus();
         setApiStatus(status);
+        window.dispatchEvent(new CustomEvent('interviewiq:llm_status_updated', { detail: status }));
       } catch (err) {
         console.error('Failed to load API status:', err);
       } finally {
@@ -66,6 +75,26 @@ export default function SettingsPage() {
     }
     loadStatus();
   }, []);
+
+  const handleTestConnection = async () => {
+    setTestingConnection(true);
+    try {
+      const res = await api.testLlmConnection();
+      setApiStatus(res);
+      window.dispatchEvent(new CustomEvent('interviewiq:llm_status_updated', { detail: res }));
+      if (res.connection_status === 'connected') {
+        addToast(res.message || 'LLM connection verified successfully!', 'success');
+      } else if (res.connection_status === 'missing_key') {
+        addToast(res.message || 'API key is not configured in backend/.env', 'warning');
+      } else {
+        addToast(res.message || `LLM connection issue: ${res.connection_status}`, 'error');
+      }
+    } catch (err) {
+      addToast(err.message || 'Failed to test LLM connection', 'error');
+    } finally {
+      setTestingConnection(false);
+    }
+  };
 
   const handleSaveProfile = async (e) => {
     e.preventDefault();
@@ -390,7 +419,7 @@ export default function SettingsPage() {
       {activeTab === 'api' && (
         <div className="space-y-6">
           <div className="p-6 sm:p-8 rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm space-y-6">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <h3 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
                   <Sparkles className="w-4 h-4 text-brand-600" />
@@ -401,44 +430,126 @@ export default function SettingsPage() {
                 </p>
               </div>
 
-              {apiStatus && (
-                <span
-                  className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border ${
-                    apiStatus.is_configured
-                      ? 'bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800'
-                      : 'bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800'
-                  }`}
+              <div className="flex items-center gap-3">
+                {apiStatus && (() => {
+                  const statusInfo = getStatusDisplay(apiStatus);
+                  return (
+                    <span
+                      className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border ${statusInfo.color}`}
+                    >
+                      {statusInfo.icon === 'check' ? (
+                        <ShieldCheck className="w-4 h-4 text-emerald-500" />
+                      ) : statusInfo.icon === 'error' ? (
+                        <XCircle className="w-4 h-4 text-rose-500" />
+                      ) : statusInfo.icon === 'info' ? (
+                        <ShieldCheck className="w-4 h-4 text-blue-500" />
+                      ) : (
+                        <AlertTriangle className="w-4 h-4 text-amber-500" />
+                      )}
+                      <span>{statusInfo.label}</span>
+                    </span>
+                  );
+                })()}
+
+                <button
+                  type="button"
+                  onClick={handleTestConnection}
+                  disabled={testingConnection || statusLoading}
+                  className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-brand-600 hover:bg-brand-700 text-white shadow-sm disabled:opacity-50 transition-colors"
                 >
-                  {apiStatus.is_configured ? (
-                    <ShieldCheck className="w-4 h-4 text-emerald-500" />
+                  {testingConnection ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   ) : (
-                    <AlertCircle className="w-4 h-4 text-amber-500" />
+                    <RefreshCw className="w-3.5 h-3.5" />
                   )}
-                  <span>{apiStatus.is_configured ? 'Active & Connected' : 'Simulated / Demo Mode'}</span>
-                </span>
-              )}
+                  <span>{testingConnection ? 'Testing...' : 'Test Connection'}</span>
+                </button>
+              </div>
             </div>
+
+            {/* Status Feedback Message Banner */}
+            {apiStatus?.message && (
+              <div
+                className={`p-4 rounded-2xl border text-xs flex items-start gap-3 ${
+                  apiStatus.connection_status === 'connected'
+                    ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200'
+                    : apiStatus.connection_status === 'missing_key'
+                    ? 'bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200'
+                    : 'bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200'
+                }`}
+              >
+                {apiStatus.connection_status === 'connected' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+                )}
+                <div className="space-y-1">
+                  <p className="font-semibold">{apiStatus.message}</p>
+                  {apiStatus.connection_status === 'authentication_error' && (
+                    <p className="text-[11px] opacity-90">
+                      Google AI Studio rejected the API key. Please verify that your Gemini API key in <code className="bg-rose-100 dark:bg-rose-900/40 px-1 py-0.5 rounded font-mono">backend/.env</code> has no extra spaces or quotes.
+                    </p>
+                  )}
+                  {apiStatus.connection_status === 'quota_exceeded' && (
+                    <p className="text-[11px] opacity-90">
+                      Your Gemini API rate limit or free quota has been exhausted. Check your usage on Google AI Studio.
+                    </p>
+                  )}
+                  {apiStatus.connection_status === 'invalid_model' && (
+                    <p className="text-[11px] opacity-90">
+                      The specified model is not supported or recognized. Try <code className="bg-rose-100 dark:bg-rose-900/40 px-1 py-0.5 rounded font-mono">gemini-2.5-flash</code>.
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
 
             {/* Provider Details Grid */}
             {apiStatus && (
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 text-xs">
                 <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
                   <span className="text-slate-400 font-medium">Configured Provider</span>
-                  <p className="text-sm font-bold text-slate-800 dark:text-slate-100 mt-1">
-                    {apiStatus.llm_provider}
+                  <p className="text-sm font-bold text-slate-800 dark:text-slate-100 mt-1 capitalize">
+                    {apiStatus.provider || apiStatus.llm_provider}
                   </p>
                 </div>
                 <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
                   <span className="text-slate-400 font-medium">Active Inference Model</span>
-                  <p className="text-sm font-bold text-slate-800 dark:text-slate-100 mt-1">
-                    {apiStatus.llm_model}
+                  <p className="text-sm font-bold text-slate-800 dark:text-slate-100 mt-1 font-mono">
+                    {apiStatus.model || apiStatus.llm_model}
                   </p>
                 </div>
                 <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
                   <span className="text-slate-400 font-medium">API Key Status</span>
-                  <p className="text-sm font-bold text-slate-800 dark:text-slate-100 mt-1">
-                    {apiStatus.has_api_key ? 'Encrypted & Stored' : 'Not Configured'}
-                  </p>
+                  <div className="text-sm font-bold text-slate-800 dark:text-slate-100 mt-1 flex items-center gap-1.5">
+                    {apiStatus.api_key_configured ? (
+                      <>
+                        <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                        <span>Configured & Stored</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="w-2 h-2 rounded-full bg-amber-500" />
+                        <span>Not Configured</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-800">
+                  <span className="text-slate-400 font-medium">Operating Mode</span>
+                  <div className="text-sm font-bold text-slate-800 dark:text-slate-100 mt-1 flex items-center gap-1.5">
+                    {apiStatus.mode === 'live' ? (
+                      <>
+                        <Zap className="w-3.5 h-3.5 text-brand-500" />
+                        <span className="text-brand-600 dark:text-brand-400">Live AI Mode</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="w-2 h-2 rounded-full bg-amber-400" />
+                        <span className="text-amber-600 dark:text-amber-400">Simulated / Demo</span>
+                      </>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
